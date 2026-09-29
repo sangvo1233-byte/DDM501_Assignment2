@@ -1,0 +1,7 @@
+# Dependencies for run_experiments.py (same pins as the Lab 2 pipeline).
+pandas==2.2.3
+numpy==2.2.1
+scikit-learn==1.6.0
+joblib==1.4.2
+pyarrow==18.1.0
+mlflow==2.19.0

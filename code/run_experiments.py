@@ -1,9 +1,10 @@
 """
 Experiment matrix for Assignment 2 — credit default risk.
 
-Reuses the Lab 2 pipeline package (ingestion, validation, feature engineering,
-evaluation) so every number in the report comes from the same code that the
-Airflow DAG runs. Each configuration is one MLflow run in the experiment
+The `pipeline/` package here is a copy of the Lab 2 modules (ingestion,
+validation, feature engineering, evaluation), vendored so this repository runs on
+its own: every number in the report comes from the same code the Lab 2 Airflow
+DAG runs. Each configuration is one MLflow run in the experiment
 "a2-credit-default-matrix".
 
 Usage:
@@ -16,27 +17,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-LAB2 = Path(__file__).resolve().parents[2] / "DDM501_Lab2"
-sys.path.insert(0, str(LAB2))
+import mlflow
+import mlflow.sklearn
+import numpy as np
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 
-import mlflow  # noqa: E402
-import mlflow.sklearn  # noqa: E402
-import numpy as np  # noqa: E402
-from sklearn.dummy import DummyClassifier  # noqa: E402
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.pipeline import Pipeline  # noqa: E402
-
-from pipeline.config import RANDOM_STATE, RAW_FEATURES  # noqa: E402
-from pipeline.data_ingestion import load_and_split, load_raw  # noqa: E402
-from pipeline.evaluation import compute_group_metrics, compute_metrics, fairness_gap  # noqa: E402
-from pipeline.preprocessing import add_derived_features, build_preprocessor  # noqa: E402
-from pipeline.validation import validate_dataset  # noqa: E402
+from pipeline.config import RANDOM_STATE, RAW_FEATURES
+from pipeline.data_ingestion import load_and_split, load_raw
+from pipeline.evaluation import compute_group_metrics, compute_metrics, fairness_gap
+from pipeline.preprocessing import add_derived_features, build_preprocessor
+from pipeline.validation import validate_dataset
 
 EXPERIMENT = "a2-credit-default-matrix"
 TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", (Path(__file__).parent / "mlruns").as_uri())
