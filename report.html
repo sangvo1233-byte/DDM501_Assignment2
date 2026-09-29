@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DDM501 Assignment 2 — ML Pipeline Design &amp; MLOps Analysis</title>
+<link rel="stylesheet" href="../_report_style.css">
+</head>
+<body>
+
+<div class="cover">
+  <h1>ML Pipeline Design &amp; MLOps Analysis</h1>
+  <div style="font-size:13pt;margin-bottom:6pt">Credit Default Risk Scoring, continued from Assignment 1</div>
+  <table class="meta">
+    <tr><td>Course</td><td>DDM501 — AI in DevOps, DataOps, MLOps</td></tr>
+    <tr><td>Assignment</td><td>Individual Assignment 2 (5%)</td></tr>
+    <tr><td>Student</td><td>Võ Minh Sang — 25MS13286</td></tr>
+  </table>
+</div>
+
+<div class="note">
+<b>Recap of Assignment 1.</b> A consumer finance company needs a real-time service that estimates each credit card
+applicant's probability of defaulting next month. The service maps that probability to APPROVE (&lt; 0.30), REVIEW
+(0.30–0.60) or DECLINE (≥ 0.60). The architecture has an offline training pipeline orchestrated by Airflow and
+tracked in MLflow, and a FastAPI scoring service that serves the <code>@champion</code> model from the MLflow
+registry and is monitored with Prometheus and Grafana. The primary metric is ROC AUC (target ≥ 0.75), with PR AUC,
+recall at the 0.30 threshold, Brier score and a <b>fairness gate</b> (selection-rate gap between sexes ≤ 0.10).
+<br><b>Refinements in this document:</b> (1) feature derivation now runs <i>inside</i> the model pipeline, which
+removes training–serving skew; (2) validation became an explicit three-level gate placed before training;
+(3) the registry uses aliases instead of the deprecated stages; (4) rejected models are still registered, to keep an
+audit trail. All results below were produced by running the code in this report.
+</div>
+
+<h2>1. Pipeline Design</h2>
+
+<h3>1.1 Pipeline architecture</h3>
+<figure>
+<svg viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial" font-size="12">
+  <defs>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#44505c"/></marker>
+    <style>.b{fill:#fff;stroke:#44505c;stroke-width:1.3}.g{fill:#fff6e5;stroke:#c98a00;stroke-width:1.3}.t{font-weight:600}.l{stroke:#44505c;stroke-width:1.3;fill:none;marker-end:url(#a)}.s{font-size:10.3px;fill:#5b6470}.r{stroke:#b3261e;stroke-width:1.2;fill:none;stroke-dasharray:4 3;marker-end:url(#a)}</style>
+  </defs>
+  <rect class="b" x="10" y="40" width="120" height="70" rx="6"/><text x="20" y="60" class="t">1 Ingestion</text><text x="20" y="77" class="s">CSV / DB snapshot</text><text x="20" y="91" class="s">seeded stratified</text><text x="20" y="104" class="s">80/20 split</text>
+  <rect class="g" x="155" y="40" width="120" height="70" rx="6"/><text x="165" y="60" class="t">2 Validation</text><text x="165" y="77" class="s">schema · stats ·</text><text x="165" y="91" class="s">semantics</text><text x="165" y="104" class="s">GATE: raise → stop</text>
+  <rect class="b" x="300" y="40" width="130" height="70" rx="6"/><text x="310" y="60" class="t">3 Preprocessing</text><text x="310" y="77" class="s">median impute,</text><text x="310" y="91" class="s">scale, one-hot</text><text x="310" y="104" class="s">(fit on train only)</text>
+  <rect class="b" x="455" y="40" width="130" height="70" rx="6"/><text x="465" y="60" class="t">4 Feature eng.</text><text x="465" y="77" class="s">utilisation, pay ratio,</text><text x="465" y="91" class="s">max delay, #delayed,</text><text x="465" y="104" class="s">avg bill, avg pay</text>
+  <rect class="b" x="610" y="40" width="120" height="70" rx="6"/><text x="620" y="60" class="t">5 Training</text><text x="620" y="77" class="s">sklearn Pipeline</text><text x="620" y="91" class="s">MLflow run: params,</text><text x="620" y="104" class="s">artifacts, model</text>
+  <rect class="b" x="755" y="40" width="135" height="70" rx="6"/><text x="765" y="60" class="t">6 Evaluation</text><text x="765" y="77" class="s">AUC, PR AUC, recall,</text><text x="765" y="91" class="s">Brier, per-group</text><text x="765" y="104" class="s">fairness gap</text>
+  <path class="l" d="M130,75 L153,75"/><path class="l" d="M275,75 L298,75"/><path class="l" d="M430,75 L453,75"/><path class="l" d="M585,75 L608,75"/><path class="l" d="M730,75 L753,75"/>
+  <rect class="g" x="700" y="160" width="190" height="62" rx="6"/><text x="710" y="180" class="t">7 Quality gate</text><text x="710" y="197" class="s">AUC≥0.70 · PR AUC≥0.45 ·</text><text x="710" y="211" class="s">gap≤0.10 (missing = fail)</text>
+  <path class="l" d="M822,110 L822,158"/>
+  <rect class="b" x="440" y="160" width="220" height="62" rx="6"/><text x="450" y="180" class="t">8 Registry (MLflow)</text><text x="450" y="197" class="s">register every version + tag;</text><text x="450" y="211" class="s">alias @champion / @challenger</text>
+  <path class="l" d="M700,191 L662,191"/>
+  <rect class="b" x="170" y="160" width="230" height="62" rx="6"/><text x="180" y="180" class="t">9 Deployment</text><text x="180" y="197" class="s">API loads models:/…@champion;</text><text x="180" y="211" class="s">CI builds image → staging → prod</text>
+  <path class="l" d="M440,191 L402,191"/>
+  <rect class="b" x="10" y="160" width="130" height="62" rx="6"/><text x="20" y="180" class="t">10 Monitoring</text><text x="20" y="197" class="s">PSI drift, score dist.,</text><text x="20" y="211" class="s">fairness, golden signals</text>
+  <path class="l" d="M170,191 L142,191"/>
+  <path class="r" d="M75,222 C75,300 520,300 520,112"/><text x="200" y="292" class="s" fill="#b3261e">drift ≥ 0.25 or schedule → re-run pipeline (Airflow)</text>
+  <path class="r" d="M215,112 C215,140 60,130 60,158"/><text x="40" y="140" class="s" fill="#b3261e">fail → alert, no training</text>
+  <text x="10" y="25" class="s">Data flow: raw frame (30,000×24) → validated frame + report → 29 engineered columns → fitted Pipeline → metrics JSON → registered version → served model</text>
+</svg>
+<figcaption>Figure 1. Pipeline architecture. Amber boxes are gates that can stop the run. Preprocessing and feature engineering are fitted inside a single scikit-learn Pipeline, so exactly the same transformations run in serving.</figcaption>
+</figure>
+
+<h3>1.2 Stage specifications</h3>
+<table>
+  <tr><th style="width:13%">Stage</th><th style="width:22%">Purpose</th><th style="width:22%">Input → Output</th><th>Key operations</th><th style="width:20%">Quality gate</th></tr>
+  <tr><td>Ingestion</td><td>A reproducible snapshot and split</td><td>CSV/DB → frame; X/y train/test; stats</td><td><code>load_raw</code>, stratified <code>train_test_split(random_state=501)</code>, <code>dataset_stats</code></td><td>30,000 rows × 24 columns; train/test default rates within 1 pp</td></tr>
+  <tr><td>Validation</td><td>Stop broken data before it becomes a model</td><td>Raw frame → report dict (raises on error)</td><td>Schema (23 features + target, numeric), statistics (≥ 5,000 rows, ≤ 2% missing, 5–60% positive rate), semantics (codes, AGE 18–100, PAY −2..8, PAY_AMT ≥ 0)</td><td>Any error raises <code>DataValidationError</code>; the DAG task fails and training never runs</td></tr>
+  <tr><td>Preprocessing</td><td>Numerically sound model inputs</td><td>Feature frame → matrix</td><td>ColumnTransformer: one-hot (<code>handle_unknown="ignore"</code>) for SEX/EDUCATION/MARRIAGE; median impute + StandardScaler for the rest</td><td>Returned <i>unfitted</i>, then fitted on the training fold only (no leakage)</td></tr>
+  <tr><td>Feature engineering</td><td>Encode analyst knowledge</td><td>23 raw → 29 columns</td><td>utilisation = mean(BILL)/LIMIT; payment_ratio = PAY_AMT1/BILL_AMT1 (clipped to 0–5); max_delay; n_months_delayed; avg_bill; avg_pay</td><td>Returns a copy; divides by <code>replace(0, NaN)</code>, so there is never an inf</td></tr>
+  <tr><td>Training</td><td>Fit and record the run</td><td>Features, labels, params → Pipeline, run_id</td><td>Model families LogReg / RF / HGB; log params, data stats, validation report, feature list, model with signature</td><td>The run is tagged <code>data_validation=passed</code></td></tr>
+  <tr><td>Evaluation</td><td>Measure quality and fairness</td><td>Model, test split → metrics dict</td><td>ROC AUC and PR AUC (on probabilities); precision, recall and F1 at 0.30 (on labels); Brier; confusion counts; per-group metrics; gap</td><td>Groups with n &lt; 50 or only one class are skipped</td></tr>
+  <tr><td>Registry / deployment</td><td>Decide what production serves</td><td>run_id, metrics → version, alias</td><td>Register every version; gate; <code>beats_champion</code> with a margin of 0.002; tags <code>quality_gate</code>, <code>outcome</code></td><td>Only champion changes serving; rejected models are still recorded</td></tr>
+</table>
+
+<h3>1.3 Design rationale</h3>
+<ul>
+  <li><b>Validation before training, not just after ingestion.</b> The expensive and risky step is training and
+  promotion. A degenerate target (all zeros) still trains "successfully" and scores 100% accuracy. Placing the gate
+  directly upstream of training guarantees that no model is produced from data that failed a check, and its report
+  travels with the run as an artifact.</li>
+  <li><b>Modularity and reuse.</b> Each stage is a pure function in the <code>pipeline/</code> package, with plain
+  inputs and outputs. The same functions are called by the CLI runner, the experiment sweep, the Airflow DAG and the
+  tests. The DAG orchestrates and never reimplements the logic, so the scheduled model and the tested model are the
+  same code.</li>
+  <li><b>Error handling and recovery.</b> Validators return lists of errors, so one run reports every problem at
+  once. Airflow retries transient failures once after 2 minutes. A failed task stops everything downstream. The
+  cleanup task uses <code>none_failed_min_one_success</code>, so it runs on either branch. MLflow runs are atomic,
+  and the champion alias is repointed only after all checks pass, so a failure mid-run leaves production untouched.</li>
+  <li><b>Scalability.</b> Stages exchange files on a shared volume and pass only metadata through XCom, so they can
+  move to separate workers (LocalExecutor now, CeleryExecutor or KubernetesExecutor later). The data (about
+  1.2 million rows in production) fits in memory, and HistGradientBoosting trains in under a second on 24,000 rows.
+  If the data grew by 100×, ingestion would move to Spark while the rest stays unchanged.</li>
+</ul>
+
+<h2>2. Experiment Tracking &amp; Metrics Analysis</h2>
+
+<h3>2.1 Experiment design</h3>
+<p><b>Variables:</b> algorithm family (Dummy, LogisticRegression, RandomForest, HistGradientBoosting); hyperparameters
+(C, depth, trees, learning rate, L2); features (23 raw vs 29 with the engineered features); preprocessing and
+imbalance handling (<code>class_weight="balanced"</code>). <b>Baseline:</b> E0, which predicts the training prior for
+everyone. Its ROC AUC of 0.50 is the floor, and E1 (logistic regression on raw features) is the simple model that any
+complex model must beat.</p>
+
+<table>
+  <tr><th>ID</th><th>Family</th><th>Features</th><th>Key hyperparameters</th><th>Question it answers</th></tr>
+  <tr><td>E0</td><td>Dummy (prior)</td><td>raw</td><td>strategy=prior</td><td>What does "no skill" score?</td></tr>
+  <tr><td>E1</td><td>LogReg</td><td>raw</td><td>C=1.0</td><td>Simple linear baseline</td></tr>
+  <tr><td>E2</td><td>LogReg</td><td>derived</td><td>C=1.0</td><td>Do engineered features help a linear model?</td></tr>
+  <tr><td>E3</td><td>LogReg</td><td>derived</td><td>C=0.1</td><td>Does stronger regularisation matter?</td></tr>
+  <tr><td>E4</td><td>LogReg</td><td>derived</td><td>C=1.0, class_weight=balanced</td><td>Effect of reweighting the minority class</td></tr>
+  <tr><td>E5</td><td>RandomForest</td><td>derived</td><td>200 trees, depth 8, leaf 20</td><td>Shallow bagging ensemble</td></tr>
+  <tr><td>E6</td><td>RandomForest</td><td>derived</td><td>300 trees, depth 12, leaf 20</td><td>Deeper forest</td></tr>
+  <tr><td>E7</td><td>HistGB</td><td>raw</td><td>300 iter, lr 0.06, depth 6, L2 1.0</td><td>Do trees need engineered features?</td></tr>
+  <tr><td>E8</td><td>HistGB</td><td>derived</td><td>300 iter, lr 0.06, depth 6, L2 1.0</td><td>Default production candidate</td></tr>
+  <tr><td>E9</td><td>HistGB</td><td>derived</td><td>500 iter, lr 0.03, depth 8, L2 2.0</td><td>Slower learning, more regularisation</td></tr>
+</table>
+
+<h3>2.2 Metrics strategy</h3>
+<ul>
+  <li><b>Primary: ROC AUC.</b> It is independent of the threshold and measures ranking quality. The business applies
+  its own thresholds, so ranking is what the model owes it.</li>
+  <li><b>Secondary:</b> PR AUC (sensitive to the 23% minority class, which is where the losses are); precision and
+  recall at 0.30 (the REVIEW threshold: recall is the share of future defaulters stopped, precision the share of
+  flagged applicants who really default); Brier score (the thresholds act on raw probabilities, so calibration
+  matters); training time and per-row latency (operating cost).</li>
+  <li><b>Guardrail: fairness gap.</b> The maximum difference in selection rate (score ≥ 0.30) between SEX groups.
+  It is a hard gate at 0.10.</li>
+  <li><b>Link to the business.</b> Recall at 0.30 maps to the <i>loss reduction</i> goal, the flag rate
+  (TP + FP)/N maps to the <i>manual review workload</i> goal, and the fairness gap maps to the <i>compliance</i> goal.
+  A 0.01 gain in AUC matters only if it does not push the review rate or the fairness gap past their limits.</li>
+</ul>
+
+<h3>2.3 Code: MLflow set-up, logging and registration</h3>
+<pre># pipeline/training.py — experiment set-up and one tracked run
+def setup_mlflow(tracking_uri: str = MLFLOW_TRACKING_URI,
+                 experiment_name: str = MLFLOW_EXPERIMENT_NAME) -> str:
+    """Point MLflow at the tracking store and make sure the experiment exists."""
+    mlflow.set_tracking_uri(tracking_uri)          # file store locally, http://mlflow:5000 in Docker
+    mlflow.set_experiment(experiment_name)
+    return tracking_uri
+
+with mlflow.start_run(run_name=run_name) as run:
+    mlflow.log_param("model_type", model_type)
+    mlflow.log_param("n_features", len(feature_columns))
+    mlflow.log_param("random_state", RANDOM_STATE)
+    for key, value in params.items():                  # every hyper-parameter
+        mlflow.log_param(key, value)
+    mlflow.log_dict(validation_report, "validation_report.json")      # why the data was trusted
+    mlflow.set_tag("data_validation", "passed" if validation_report["passed"] else "failed")
+    mlflow.log_dict({"features": feature_columns}, "feature_columns.json")  # what serving must send
+    pipeline = build_pipeline(model_type, feature_columns, **params).fit(X_train, y_train)
+    mlflow.sklearn.log_model(sk_model=pipeline, artifact_path="model",
+                             input_example=X_train.head(3).astype("float64"))  # signature
+
+# pipeline/evaluation.py — metrics logged back into the same run
+with mlflow.start_run(run_id=run_id):
+    mlflow.log_metrics({"roc_auc": ..., "pr_auc": ..., "recall": ..., "brier": ...})
+    mlflow.log_metric("fairness_gap", gap)
+    mlflow.log_dict(result, "evaluation.json")          # includes per-group metrics</pre>
+
+<pre># pipeline/registry.py — register, gate, alias (aliases replace deprecated stages)
+def promote_model(run_id: str, metrics: Dict[str, float],
+                  model_name: str = "credit-default-classifier") -> Dict[str, Any]:
+    client = MlflowClient()
+    gate = passes_quality_gate(metrics)                  # missing metric => fail (fail closed)
+    version = mlflow.register_model(f"runs:/{run_id}/model", model_name).version
+    if not gate["passed"]:
+        outcome = "rejected"                             # registered for the audit trail, no alias
+    elif beats_champion(metrics, model_name, margin=0.002):
+        outcome = "champion"
+        client.set_registered_model_alias(model_name, "champion", version)
+    else:
+        outcome = "challenger"
+        client.set_registered_model_alias(model_name, "challenger", version)
+    client.set_model_version_tag(model_name, version, "quality_gate",
+                                 "passed" if gate["passed"] else "failed")
+    client.set_model_version_tag(model_name, version, "outcome", outcome)
+    return {"version": version, "outcome": outcome, "quality_gate": gate}
+
+# serving loads by alias, never by a hard-coded version number
+model = mlflow.sklearn.load_model("models:/credit-default-classifier@champion")</pre>
+<p><b>Versioning convention.</b> There is one registered model per use case
+(<code>credit-default-classifier</code>), with versions numbered automatically. The alias <code>@champion</code> is
+what serving loads and <code>@challenger</code> is the next candidate. The tags <code>quality_gate</code>,
+<code>outcome</code> and <code>failed_checks</code> record why each version was or was not promoted. Every version
+links back to its run, and so to its parameters, data statistics, validation report and feature list.</p>
+
+<h3>2.4 Results</h3>
+<p>Held-out test set: 6,000 rows, 23.3% positive. The decision threshold is 0.30. Latency is the batch-scoring time
+divided by the number of rows.</p>
+<table>
+  <tr><th>ID</th><th class="num">ROC AUC</th><th class="num">PR AUC</th><th class="num">Precision</th><th class="num">Recall</th><th class="num">F1</th><th class="num">Brier</th><th class="num">Fairness gap</th><th class="num">Train (s)</th><th class="num">µs / row</th><th>Gate</th></tr>
+  <tr><td>E0 prior</td><td class="num">0.5000</td><td class="num">0.2328</td><td class="num">0.000</td><td class="num">0.000</td><td class="num">0.000</td><td class="num">0.1786</td><td class="num">0.0000</td><td class="num">0.03</td><td class="num">0.7</td><td>fail</td></tr>
+  <tr><td>E1 logreg raw</td><td class="num">0.7449</td><td class="num">0.5448</td><td class="num">0.537</td><td class="num">0.503</td><td class="num">0.520</td><td class="num">0.1457</td><td class="num">0.0543</td><td class="num">0.05</td><td class="num">0.7</td><td>pass</td></tr>
+  <tr><td>E2 logreg derived</td><td class="num"><b>0.7511</b></td><td class="num"><b>0.5534</b></td><td class="num">0.533</td><td class="num">0.507</td><td class="num">0.520</td><td class="num"><b>0.1440</b></td><td class="num">0.0544</td><td class="num">0.06</td><td class="num">0.8</td><td>pass</td></tr>
+  <tr><td>E3 logreg C=0.1</td><td class="num">0.7511</td><td class="num">0.5534</td><td class="num">0.531</td><td class="num">0.507</td><td class="num">0.519</td><td class="num">0.1440</td><td class="num">0.0558</td><td class="num">0.08</td><td class="num">0.8</td><td>pass</td></tr>
+  <tr><td>E4 logreg balanced</td><td class="num">0.7505</td><td class="num">0.5528</td><td class="num">0.288</td><td class="num"><b>0.896</b></td><td class="num">0.436</td><td class="num">0.1917</td><td class="num">0.0810</td><td class="num">0.05</td><td class="num">0.8</td><td>pass</td></tr>
+  <tr><td>E5 RF depth 8</td><td class="num">0.7482</td><td class="num">0.5393</td><td class="num">0.564</td><td class="num">0.483</td><td class="num">0.520</td><td class="num">0.1452</td><td class="num">0.0324</td><td class="num">0.54</td><td class="num">6.9</td><td>pass</td></tr>
+  <tr><td>E6 RF depth 12</td><td class="num">0.7502</td><td class="num">0.5406</td><td class="num">0.554</td><td class="num">0.486</td><td class="num">0.518</td><td class="num">0.1450</td><td class="num">0.0352</td><td class="num">0.93</td><td class="num">10.4</td><td>pass</td></tr>
+  <tr><td>E7 HGB raw</td><td class="num">0.7481</td><td class="num">0.5461</td><td class="num">0.566</td><td class="num">0.480</td><td class="num">0.520</td><td class="num">0.1447</td><td class="num">0.0333</td><td class="num">0.22</td><td class="num">1.4</td><td>pass</td></tr>
+  <tr><td>E8 HGB derived</td><td class="num">0.7473</td><td class="num">0.5444</td><td class="num">0.556</td><td class="num">0.482</td><td class="num">0.516</td><td class="num">0.1448</td><td class="num">0.0306</td><td class="num">0.18</td><td class="num">1.4</td><td>pass</td></tr>
+  <tr class="best"><td>E9 HGB slow</td><td class="num">0.7475</td><td class="num">0.5435</td><td class="num">0.559</td><td class="num">0.485</td><td class="num">0.520</td><td class="num">0.1449</td><td class="num"><b>0.0276</b></td><td class="num">0.36</td><td class="num">2.4</td><td>pass</td></tr>
+</table>
+
+<h3>2.5 Analysis</h3>
+<ul>
+  <li><b>Every real model beats the baseline by a wide margin</b> (AUC +0.25, PR AUC more than doubles), but the
+  models differ from each other by only 0.006 AUC. On 6,000 test rows the standard error of AUC is about 0.007, so
+  <i>no family is significantly more accurate</i>. The decision has to rest on the other metrics.</li>
+  <li><b>Features matter more than the algorithm for linear models.</b> The engineered ratios lift logistic
+  regression from 0.745 to 0.751 (E1 → E2) and make it the most accurate family. Trees gain nothing (E7 → E8),
+  because they can already approximate ratios with splits. Regularisation (E3) makes no difference: 24,000 rows and
+  29 features are far from overfitting a linear model.</li>
+  <li><b>class_weight="balanced" changes the operating point, not the ranking.</b> E4 has the same AUC as E2, but
+  its probabilities are no longer calibrated (Brier 0.19 against 0.14). At the 0.30 threshold it flags most
+  applicants: recall 0.90, precision 0.29. That would roughly triple the manual review queue and widen the fairness
+  gap to 0.081. Recall should be adjusted by moving the threshold, not by breaking calibration.</li>
+  <li><b>Accuracy vs fairness.</b> The most accurate family (logistic regression, gap 0.054–0.056) treats the two
+  groups least evenly. The tree ensembles cut the gap roughly in half (0.028–0.035) for at most 0.004 AUC. All models
+  pass the 0.10 gate, so the gate alone does not decide; the business priority does.</li>
+  <li><b>Cost.</b> Every candidate scores in under 11 µs per row, far inside the 100 ms budget. Random forests are
+  the slowest to train and score, and their model files are the largest.</li>
+</ul>
+<p><b>Recommendation: E9 (HistGradientBoosting on engineered features, lr 0.03, depth 8, L2 2.0) as
+<code>@champion</code>, with E2 (logistic regression) as <code>@challenger</code>.</b> E9 has the narrowest fairness
+gap (0.028, about half of E2's). Its AUC is within 0.004 of the best, which is statistical noise, and its
+calibration (Brier 0.145) and precision and recall at the business threshold are as good as the best. SHAP
+explanations are available through TreeExplainer. E2 stays registered as the challenger because it is simpler and
+more stable, and it would win if a future run showed a gain beyond the 0.002 champion margin at an acceptable gap.</p>
+
+<h2>3. Workflow Orchestration Design</h2>
+
+<h3>3.1 DAG architecture</h3>
+<figure>
+<svg viewBox="0 0 900 150" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial" font-size="12">
+  <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#44505c"/></marker>
+  <style>.n{fill:#e8f1fb;stroke:#1f5fa8;stroke-width:1.3}.br{fill:#fff6e5;stroke:#c98a00;stroke-width:1.3}.e{stroke:#44505c;stroke-width:1.3;fill:none;marker-end:url(#b)}.s{font-size:10px;fill:#5b6470}</style></defs>
+  <rect class="n" x="10" y="55" width="90" height="36" rx="18"/><text x="30" y="78">ingest</text>
+  <rect class="n" x="125" y="55" width="90" height="36" rx="18"/><text x="140" y="78">validate</text>
+  <rect class="n" x="240" y="55" width="90" height="36" rx="18"/><text x="265" y="78">train</text>
+  <rect class="n" x="355" y="55" width="90" height="36" rx="18"/><text x="370" y="78">evaluate</text>
+  <rect class="br" x="470" y="55" width="90" height="36" rx="18"/><text x="490" y="78">decide</text>
+  <rect class="n" x="600" y="15" width="130" height="36" rx="18"/><text x="615" y="38">promote_model</text>
+  <rect class="n" x="600" y="95" width="130" height="36" rx="18"/><text x="612" y="118">skip_promotion</text>
+  <rect class="n" x="775" y="55" width="100" height="36" rx="18"/><text x="800" y="78">cleanup</text>
+  <path class="e" d="M100,73 L123,73"/><path class="e" d="M215,73 L238,73"/><path class="e" d="M330,73 L353,73"/><path class="e" d="M445,73 L468,73"/>
+  <path class="e" d="M560,68 L598,36"/><path class="e" d="M560,78 L598,110"/>
+  <path class="e" d="M730,33 L773,66"/><path class="e" d="M730,113 L773,82"/>
+  <text x="565" y="47" class="s">gate passed</text><text x="565" y="112" class="s">gate failed</text>
+  <text x="735" y="140" class="s">trigger_rule = none_failed_min_one_success</text>
+</svg>
+<figcaption>Figure 2. The <code>credit_default_training</code> DAG. <code>decide</code> is a BranchPythonOperator; the side that is not chosen is marked skipped.</figcaption>
+</figure>
+<table>
+  <tr><th style="width:15%">Task</th><th>Description</th><th style="width:30%">XCom out (metadata only)</th></tr>
+  <tr><td>ingest</td><td>Load the raw data, split it, write <code>split.joblib</code> and <code>raw.parquet</code> to the per-run directory on the shared volume.</td><td><code>run_dir</code>, <code>data_stats</code></td></tr>
+  <tr><td>validate</td><td>Three-level validation with <code>raise_on_error=True</code>; write <code>validation_report.json</code>.</td><td><code>validation_report</code></td></tr>
+  <tr><td>train</td><td>Fit the Pipeline inside an MLflow run named <code>airflow-{ds}</code>; dump <code>model.joblib</code>.</td><td><code>mlflow_run_id</code></td></tr>
+  <tr><td>evaluate</td><td>Metrics and per-group metrics, logged to the same run; full JSON to disk.</td><td><code>metrics</code> (scalars only)</td></tr>
+  <tr><td>decide</td><td>Apply <code>passes_quality_gate</code>; return the task_id of the next task.</td><td><code>quality_gate</code></td></tr>
+  <tr><td>promote_model</td><td>Register the model, compare with the champion, set the alias.</td><td><code>promotion</code></td></tr>
+  <tr><td>skip_promotion</td><td>EmptyOperator that marks the rejected path.</td><td>—</td></tr>
+  <tr><td>cleanup</td><td>Delete the run directory on either branch.</td><td>—</td></tr>
+</table>
+<p><b>Dependencies.</b> The chain is strictly linear up to <code>decide</code>, because each task consumes the
+previous task's artifact. For example, <code>train</code> must not start unless <code>validate</code> succeeded,
+which is how a data problem stops a deployment. Only one branch after <code>decide</code> runs. <code>cleanup</code>
+depends on both branches with <code>none_failed_min_one_success</code>, because the default
+<code>all_success</code> rule would skip it on every run, since one branch is always skipped.</p>
+
+<h3>3.2 Scheduling strategy</h3>
+<ul>
+  <li><b>Trigger types:</b> time-based (<code>@weekly</code>, set by the <code>AIRFLOW_SCHEDULE</code> variable),
+  event-based (a significant-drift alert from Alertmanager calls the Airflow REST API to trigger a run), and manual
+  (after a data fix or feature change).</li>
+  <li><b>Frequency:</b> weekly. Labels arrive with a 30–60 day delay, so daily runs would refit almost the same data.
+  Monthly is too slow to respond to campaign-driven drift. <code>catchup=False</code> and
+  <code>max_active_runs=1</code> prevent overlapping runs from competing for the champion alias.</li>
+</ul>
+
+<h3>3.3 Code: DAG, tasks and dependencies</h3>
+<pre>default_args = {"owner": "mlops-team", "depends_on_past": False,
+                "retries": 1, "retry_delay": timedelta(minutes=2)}
+
+def validate(**context):
+    """Quality gate on the data. Raising here stops the DAG before training."""
+    ti = context["ti"]
+    run_dir = Path(ti.xcom_pull(task_ids="ingest", key="run_dir"))
+    report = validate_dataset(pd.read_parquet(run_dir / "raw.parquet"), raise_on_error=True)
+    (run_dir / "validation_report.json").write_text(json.dumps(report, indent=2))
+    ti.xcom_push(key="validation_report", value=report)
+
+def evaluate(**context):
+    ti = context["ti"]
+    run_dir = Path(ti.xcom_pull(task_ids="ingest", key="run_dir"))
+    split, model = joblib.load(run_dir / "split.joblib"), joblib.load(run_dir / "model.joblib")
+    result = evaluate_model(model, split["X_test"], split["y_test"],
+                            run_id=ti.xcom_pull(task_ids="train", key="mlflow_run_id"))
+    ti.xcom_push(key="metrics", value={k: v for k, v in result.items() if isinstance(v, (int, float))})
+    (run_dir / "evaluation.json").write_text(json.dumps(result, default=str))   # data -> volume
+
+def decide(**context):
+    """BranchPythonOperator: must return the task_id to run next."""
+    ti = context["ti"]
+    gate = passes_quality_gate(ti.xcom_pull(task_ids="evaluate", key="metrics") or {})
+    ti.xcom_push(key="quality_gate", value=gate)
+    return "promote_model" if gate["passed"] else "skip_promotion"
+
+with DAG(dag_id="credit_default_training", default_args=default_args,
+         schedule=os.getenv("AIRFLOW_SCHEDULE", "@weekly"), start_date=datetime(2026, 1, 1),
+         catchup=False, max_active_runs=1, tags=["ml", "training", "credit-risk"]) as dag:
+    t_ingest = PythonOperator(task_id="ingest", python_callable=ingest)
+    t_validate = PythonOperator(task_id="validate", python_callable=validate)
+    t_train = PythonOperator(task_id="train", python_callable=train)
+    t_evaluate = PythonOperator(task_id="evaluate", python_callable=evaluate)
+    t_decide = BranchPythonOperator(task_id="decide", python_callable=decide)
+    t_promote = PythonOperator(task_id="promote_model", python_callable=promote)
+    t_skip = EmptyOperator(task_id="skip_promotion")
+    t_cleanup = PythonOperator(task_id="cleanup", python_callable=cleanup,
+                               trigger_rule="none_failed_min_one_success")
+
+    t_ingest >> t_validate >> t_train >> t_evaluate >> t_decide
+    t_decide >> [t_promote, t_skip] >> t_cleanup</pre>
+
+<h3>3.4 Operational considerations</h3>
+<ul>
+  <li><b>Failure handling:</b> one retry with a 2-minute delay for transient errors, such as the MLflow server
+  restarting. Validation errors are <i>not</i> transient, and they fail on retry too, which is intended. Tasks are
+  idempotent because each run writes into its own <code>run_id</code> directory, and the alias change is a single
+  atomic registry call.</li>
+  <li><b>Alerting:</b> <code>on_failure_callback</code> posts the task, run and log URL to the team channel. The
+  <code>skip_promotion</code> path posts the <code>failed_checks</code> list, so a rejected model is visible rather
+  than silent. SLA misses (a run longer than 30 minutes) are also reported.</li>
+  <li><b>Monitoring:</b> the Airflow UI shows run and task duration history. MLflow compares runs over time. The
+  StatsD exporter sends DAG success rate and duration to Prometheus. An alert fires if no successful run happens
+  within 8 days, which catches a paused or broken scheduler.</li>
+</ul>
+
+<h2>4. Code Quality &amp; Documentation</h2>
+
+<h3>4.1 Code standards</h3>
+<ul>
+  <li><b>Style:</b> PEP 8, enforced by <b>black</b> (line length 100), <b>isort</b> (black profile) and
+  <b>flake8</b>, run by pre-commit on every commit and in CI.</li>
+  <li><b>Docstrings:</b> every public function has a one-line summary plus the <i>reason</i> behind non-obvious
+  choices (for example why <code>handle_unknown="ignore"</code>).</li>
+  <li><b>Type hints:</b> all signatures, checked by <b>mypy</b> in CI.</li>
+  <li><b>Comments:</b> used for intent and traps, not to restate the code.</li>
+</ul>
+<pre>def compute_metrics(y_true: pd.Series, y_proba: np.ndarray,
+                    threshold: float = REVIEW_THRESHOLD) -> Dict[str, float]:
+    """Aggregate metrics at a fixed decision threshold."""
+    y_pred = (y_proba >= threshold).astype(int)
+    # labels=[0, 1]: a single-class slice would otherwise return a 1x1 matrix
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return {
+        "roc_auc": float(roc_auc_score(y_true, y_proba)),        # ranking metrics take the probability
+        "pr_auc": float(average_precision_score(y_true, y_proba)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),   # threshold metrics take labels
+        ...
+    }</pre>
+
+<h3>4.2 Configuration</h3>
+<p>All tunable values live in one module, and each can be overridden by an environment variable. The same code and
+image therefore run unchanged in CI (file store), locally and in Docker (tracking server), with nothing
+hard-coded.</p>
+<pre># pipeline/config.py — config loading with environment overrides
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", (BASE_DIR / "mlruns").as_uri())
+MLFLOW_EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "credit-default-risk")
+RANDOM_STATE = int(os.getenv("RANDOM_STATE", 501))
+MIN_ROC_AUC = float(os.getenv("MIN_ROC_AUC", 0.70))
+MIN_PR_AUC = float(os.getenv("MIN_PR_AUC", 0.45))
+MAX_FAIRNESS_GAP = float(os.getenv("MAX_FAIRNESS_GAP", 0.10))
+MODEL_CONFIGS = {"logreg": {"C": 1.0, "max_iter": 1000},
+                 "hgb": {"max_iter": 300, "learning_rate": 0.06, "max_depth": 6}}
+
+# .env.example — environment for docker compose (secrets never committed)
+MLFLOW_TRACKING_URI=http://mlflow:5000
+AIRFLOW_SCHEDULE=@weekly
+MODEL_TYPE=hgb
+REVIEW_THRESHOLD=0.30
+DECLINE_THRESHOLD=0.60</pre>
+
+<h2>5. Reproducibility &amp; Versioning Strategy</h2>
+<table>
+  <tr><th style="width:15%">Artifact</th><th>Strategy</th></tr>
+  <tr><td>Code</td><td>Git with <b>GitHub Flow plus release tags</b>: short-lived <code>feature/*</code> branches → pull request (CI: lint, type check, tests, pipeline smoke run) → <code>main</code>. Releases use semantic-version tags (<code>v1.2.0</code>), which trigger the CD workflow (image built and pushed to GHCR, staging, then production after approval). Every MLflow run records the git commit hash.</td></tr>
+  <tr><td>Data</td><td>Immutable, dated snapshots (<code>data/snapshots/2026-09-28/credit.parquet</code>) tracked by <b>DVC</b>, with the content hash stored in git and the data in remote storage. The row count, positive rate and hash are logged as run parameters, so any model can be traced back to its exact data.</td></tr>
+  <tr><td>Model</td><td>MLflow registry: one name per use case, automatic version numbers, aliases <code>@champion</code> and <code>@challenger</code>, and tags <code>quality_gate</code>, <code>outcome</code> and <code>git_sha</code>. The drift reference (<code>reference.json</code>) is versioned <i>with</i> the model, because it is a property of the training data.</td></tr>
+  <tr><td>Environment</td><td>Pinned <code>requirements.txt</code>. scikit-learn and MLflow versions are identical in the training image and the serving image, because a model pickled under 1.3 does not load under 1.6. Docker images are tagged with the git SHA.</td></tr>
+</table>
+<pre># Code versioning — tag a release and record the commit in each run
+git switch -c feature/derived-features
+git commit -m "feat: add utilisation and payment ratio"   # CI runs on the PR
+git tag -a v1.2.0 -m "HGB champion, gap 0.028" && git push origin v1.2.0   # triggers CD
+mlflow.set_tag("git_sha", subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip())
+
+# Random seeds — one seed from config, applied everywhere
+RANDOM_STATE = int(os.getenv("RANDOM_STATE", 501))
+np.random.seed(RANDOM_STATE); random.seed(RANDOM_STATE)
+train_test_split(X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE)
+HistGradientBoostingClassifier(**params, random_state=RANDOM_STATE)</pre>
+<pre># docker/airflow.Dockerfile — training image, pinned to Airflow's constraints
+FROM apache/airflow:2.8.4-python3.11
+USER airflow
+ARG AIRFLOW_VERSION=2.8.4
+ARG PYTHON_VERSION=3.11
+COPY requirements-airflow.txt /tmp/requirements-airflow.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-airflow.txt \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+ENV PYTHONPATH=/opt/airflow/project
+
+# Dockerfile — serving image
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt       # layer cached until deps change
+COPY app/ ./app/
+RUN useradd --create-home --uid 1000 appuser && chown -R appuser /app
+USER appuser
+HEALTHCHECK CMD python -c "import json,urllib.request,sys; \
+  sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8000/health'))['model_loaded'] else 1)"
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]</pre>
+<p><b>Reproducing the recommended run.</b> Check out the commit recorded in the run's <code>git_sha</code> tag, then
+<code>dvc checkout</code> the data snapshot whose hash is in the run parameters. Build the image from the same tag,
+and re-run <code>python -m pipeline.run_pipeline --model-type hgb --max-iter 500 --learning-rate 0.03 --max-depth 8</code>
+with <code>RANDOM_STATE=501</code>. With the same seed, data and library versions, the metrics reproduce exactly.
+In this work, the Lab 2 sweep and this matrix were two separate runs, and the configurations they share (for example
+logistic regression with C=1.0, and HGB with 300 iterations) gave identical metrics to four decimal places.</p>
+
+<p class="small">References: MLflow documentation, "Model Registry: aliases"; Apache Airflow documentation, "Branching"
+and "Trigger rules"; Huyen (2022), <i>Designing Machine Learning Systems</i>, ch. 5–6; Sculley et al. (2015).</p>
+</body>
+</html>
