@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="900" height="150" style="background:#fff" viewBox="0 0 900 150" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial" font-size="12">
+  <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#44505c"/></marker>
+  <style>.n{fill:#e8f1fb;stroke:#1f5fa8;stroke-width:1.3}.br{fill:#fff6e5;stroke:#c98a00;stroke-width:1.3}.e{stroke:#44505c;stroke-width:1.3;fill:none;marker-end:url(#b)}.s{font-size:10px;fill:#5b6470}</style></defs>
+  <rect class="n" x="10" y="55" width="90" height="36" rx="18"/><text x="30" y="78">ingest</text>
+  <rect class="n" x="125" y="55" width="90" height="36" rx="18"/><text x="140" y="78">validate</text>
+  <rect class="n" x="240" y="55" width="90" height="36" rx="18"/><text x="265" y="78">train</text>
+  <rect class="n" x="355" y="55" width="90" height="36" rx="18"/><text x="370" y="78">evaluate</text>
+  <rect class="br" x="470" y="55" width="90" height="36" rx="18"/><text x="490" y="78">decide</text>
+  <rect class="n" x="600" y="15" width="130" height="36" rx="18"/><text x="615" y="38">promote_model</text>
+  <rect class="n" x="600" y="95" width="130" height="36" rx="18"/><text x="612" y="118">skip_promotion</text>
+  <rect class="n" x="775" y="55" width="100" height="36" rx="18"/><text x="800" y="78">cleanup</text>
+  <path class="e" d="M100,73 L123,73"/><path class="e" d="M215,73 L238,73"/><path class="e" d="M330,73 L353,73"/><path class="e" d="M445,73 L468,73"/>
+  <path class="e" d="M560,68 L598,36"/><path class="e" d="M560,78 L598,110"/>
+  <path class="e" d="M730,33 L773,66"/><path class="e" d="M730,113 L773,82"/>
+  <text x="565" y="47" class="s">gate passed</text><text x="565" y="112" class="s">gate failed</text>
+  <text x="735" y="140" class="s">trigger_rule = none_failed_min_one_success</text>
+</svg>
